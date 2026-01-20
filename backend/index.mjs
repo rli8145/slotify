@@ -9,6 +9,22 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { adInsertQueue } from "./lib/queue.mjs";
+import { createJobDir, jobDir } from "./lib/jobStorage.mjs";
+import {
+  cacheKey,
+  cacheGetBuffer,
+  cacheSetBuffer,
+  cacheGetText,
+  cacheSetText,
+} from "./lib/cache.mjs";
+
+// Same (voiceId, text) almost always recurs within a demo/testing session —
+// caching the ElevenLabs audio and OpenAI-generated copy saves real ElevenLabs
+// minutes/OpenAI tokens and turns a repeat request into a Redis GET.
+const TTS_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60; // audio for a given text+voice never changes
+const STATEMENT_CACHE_TTL_SECONDS = 24 * 60 * 60;
 
 const app = express();
 const port = Number.parseInt(process.env.PORT ?? "3001", 10);
@@ -168,6 +184,34 @@ const streamToBuffer = async (webStream) => {
     chunks.push(Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
+};
+
+// Wraps elevenlabs.textToSpeech.convert with a Redis cache keyed on the
+// exact (voiceId, text, modelId, outputFormat) tuple, since that's what
+// determines the audio bytes. Every call site buffers the result anyway
+// (to write it to disk or concat it), so caching costs nothing extra on a
+// miss and turns a repeat statement into a single Redis GET on a hit.
+const synthesizeSpeech = async ({ voiceId, text, modelId, outputFormat }) => {
+  const resolvedModelId = modelId ?? "eleven_multilingual_v2";
+  const resolvedOutputFormat = outputFormat ?? "mp3_44100_128";
+  const key = cacheKey("tts", {
+    voiceId,
+    text,
+    modelId: resolvedModelId,
+    outputFormat: resolvedOutputFormat,
+  });
+
+  const cached = await cacheGetBuffer(key);
+  if (cached) return cached;
+
+  const audio = await elevenlabs.textToSpeech.convert(voiceId, {
+    text,
+    modelId: resolvedModelId,
+    outputFormat: resolvedOutputFormat,
+  });
+  const buffer = await streamToBuffer(audio);
+  await cacheSetBuffer(key, buffer, TTS_CACHE_TTL_SECONDS);
+  return buffer;
 };
 
 const parseJsonField = (value) => {
@@ -402,6 +446,10 @@ const generateBrandStatement = async ({ name, productDesc }) => {
     return generateStatementFallback(name, productDesc);
   }
 
+  const statementCacheKey = cacheKey("statement", { name, productDesc });
+  const cachedStatement = await cacheGetText(statementCacheKey);
+  if (cachedStatement) return cachedStatement;
+
   const prompt = [
     "Write one sponsor read sentence (8-12 seconds when spoken).",
     "Sound native to the episode, calm and conversational.",
@@ -453,7 +501,9 @@ const generateBrandStatement = async ({ name, productDesc }) => {
     const raw = data?.choices?.[0]?.message?.content ?? "{}";
     const parsed = JSON.parse(raw);
     const statement = String(parsed.statement || "").trim();
-    return statement || generateStatementFallback(name, productDesc);
+    if (!statement) return generateStatementFallback(name, productDesc);
+    await cacheSetText(statementCacheKey, statement, STATEMENT_CACHE_TTL_SECONDS);
+    return statement;
   } catch (error) {
     console.warn("Statement generation failed, using fallback.", error);
     return generateStatementFallback(name, productDesc);
@@ -484,12 +534,12 @@ const buildSponsorBlock = async ({
   try {
     for (let index = 0; index < statements.length; index += 1) {
       const statement = statements[index];
-      const audio = await elevenlabs.textToSpeech.convert(voiceId, {
+      const buffer = await synthesizeSpeech({
+        voiceId,
         text: statement,
-        modelId: modelId ?? "eleven_multilingual_v2",
-        outputFormat: outputFormat ?? "mp3_44100_128",
+        modelId,
+        outputFormat,
       });
-      const buffer = await streamToBuffer(audio);
       const statementPath = path.join(tempDir, `statement-${index}.mp3`);
       await fs.promises.writeFile(statementPath, buffer);
       statementPaths.push(statementPath);
@@ -1365,14 +1415,14 @@ app.post("/api/tts", async (req, res) => {
   try {
     console.log("TTS statements:", { count: statements.length, statements });
     if (statements.length === 1) {
-      const audio = await elevenlabs.textToSpeech.convert(voiceId, {
+      const buffer = await synthesizeSpeech({
+        voiceId,
         text: statements[0],
-        modelId: modelId ?? "eleven_multilingual_v2",
-        outputFormat: outputFormat ?? "mp3_44100_128",
+        modelId,
+        outputFormat,
       });
       res.setHeader("Content-Type", "audio/mpeg");
-      const stream = Readable.fromWeb(audio);
-      stream.pipe(res);
+      res.send(buffer);
       return;
     }
 
@@ -1563,108 +1613,106 @@ app.post("/ad/insert", upload.single("audio"), async (req, res) => {
     return;
   }
 
-  const tempDir = await fs.promises.mkdtemp(
-    path.join(os.tmpdir(), "two-speaker-ad-"),
-  );
-  const basePath = path.join(tempDir, "base.mp3");
-  const outPath = path.join(tempDir, "out.mp3");
-  const cleanup = async () => {
-    await Promise.all(
-      [basePath, outPath].map((filePath) =>
-        fs.promises.unlink(filePath).catch(() => undefined),
-      ),
-    );
-    await fs.promises.rmdir(tempDir).catch(() => undefined);
-  };
-
+  // This pipeline (diarization + LLM copywriting + ElevenLabs TTS + ffmpeg
+  // mix) can run well past typical HTTP timeouts, so it's handed off to a
+  // Redis-backed queue (BullMQ) instead of running inline. The uploaded file
+  // is written to a directory shared with the worker (JOB_STORAGE_DIR, a
+  // Docker volume in docker-compose), the job is enqueued, and this handler
+  // returns immediately with a jobId the client polls via GET /api/jobs/:id.
+  const jobId = randomUUID();
   try {
-    await fs.promises.writeFile(basePath, audioFile.buffer);
+    const dir = await createJobDir(jobId);
+    const inputPath = path.join(dir, "input.mp3");
+    const outputPath = path.join(dir, "output.mp3");
+    await fs.promises.writeFile(inputPath, audioFile.buffer);
 
-    const pythonBin = process.env.PYTHON_BIN ?? "python";
-    const baseUrl =
-      process.env.API_BASE_URL ?? `http://localhost:${port}`;
+    const apiBaseUrl = process.env.API_BASE_URL ?? `http://localhost:${port}`;
 
-    const args = [
-      "-m",
-      "ad_inserter.insert_ad",
-      "--input",
-      basePath,
-      "--product-name",
-      productName,
-      "--product-blurb",
-      productBlurb,
-      "--ad-style",
-      adStyle,
-      "--ad-mode",
-      adMode,
-      "--out",
-      outPath,
-      "--tts-url",
-      `${baseUrl}/api/tts`,
-      "--clone-url",
-      `${baseUrl}/api/clone`,
-    ];
+    await adInsertQueue.add(
+      "ad-insert",
+      {
+        inputPath,
+        outputPath,
+        productName,
+        productBlurb,
+        adStyle,
+        adMode,
+        voiceIdA,
+        voiceIdB,
+        llmProvider,
+        llmModel,
+        cloneVoices,
+        apiBaseUrl,
+      },
+      { jobId },
+    );
 
-    if (voiceIdA) {
-      args.push("--voice-id-a", voiceIdA);
-    }
-    if (voiceIdB) {
-      args.push("--voice-id-b", voiceIdB);
-    }
-    if (llmProvider) {
-      args.push("--llm-provider", llmProvider);
-    }
-    if (llmModel) {
-      args.push("--llm-model", llmModel);
-    }
-    if (cloneVoices) {
-      args.push("--clone-voices");
-    }
-
-    await new Promise((resolve, reject) => {
-      const child = spawn(pythonBin, args, {
-        cwd: path.dirname(fileURLToPath(import.meta.url)),
-        env: process.env,
-      });
-      let stderr = "";
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk.toString();
-      });
-      child.on("error", reject);
-      child.on("close", (code) => {
-        if (code === 0) {
-          resolve(null);
-        } else {
-          reject(
-            new Error(
-              stderr || `ad_inserter.insert_ad exited with code ${code}`,
-            ),
-          );
-        }
-      });
+    res.status(202).json({
+      jobId,
+      statusUrl: `/api/jobs/${jobId}`,
+      resultUrl: `/api/jobs/${jobId}/result`,
     });
-    await fs.promises.access(outPath);
-    res.setHeader("Content-Type", "audio/mpeg");
-    const stream = fs.createReadStream(outPath);
-    stream.on("error", (streamError) => {
-      if (!res.headersSent) {
-        res.status(500).json({
-          error:
-            streamError instanceof Error
-              ? streamError.message
-              : "Failed to stream output.",
-        });
-      }
-    });
-    res.on("close", cleanup);
-    res.on("finish", cleanup);
-    stream.pipe(res);
   } catch (error) {
+    await fs.promises.rm(jobDir(jobId), { recursive: true, force: true }).catch(
+      () => undefined,
+    );
     res.status(500).json({
-      error: error instanceof Error ? error.message : "Insertion failed.",
+      error: error instanceof Error ? error.message : "Failed to queue job.",
     });
-    await cleanup();
   }
+});
+
+// Poll job status: queued -> active -> completed | failed.
+app.get("/api/jobs/:id", async (req, res) => {
+  const job = await adInsertQueue.getJob(req.params.id);
+  if (!job) {
+    res.status(404).json({ error: "Job not found." });
+    return;
+  }
+
+  const state = await job.getState();
+  res.json({
+    id: job.id,
+    state,
+    progress: job.progress ?? 0,
+    failedReason: state === "failed" ? job.failedReason ?? null : null,
+    resultUrl: state === "completed" ? `/api/jobs/${job.id}/result` : null,
+  });
+});
+
+// Download the finished audio once GET /api/jobs/:id reports "completed".
+app.get("/api/jobs/:id/result", async (req, res) => {
+  const job = await adInsertQueue.getJob(req.params.id);
+  if (!job) {
+    res.status(404).json({ error: "Job not found." });
+    return;
+  }
+
+  const state = await job.getState();
+  if (state !== "completed") {
+    res.status(409).json({ error: `Job is not completed yet (state: ${state}).` });
+    return;
+  }
+
+  const outputPath = job.returnvalue?.outputPath;
+  if (!outputPath || !fs.existsSync(outputPath)) {
+    res.status(410).json({ error: "Result is no longer available." });
+    return;
+  }
+
+  res.setHeader("Content-Type", "audio/mpeg");
+  const stream = fs.createReadStream(outputPath);
+  stream.on("error", (streamError) => {
+    if (!res.headersSent) {
+      res.status(500).json({
+        error:
+          streamError instanceof Error
+            ? streamError.message
+            : "Failed to stream result.",
+      });
+    }
+  });
+  stream.pipe(res);
 });
 
 app.listen(port, () => {

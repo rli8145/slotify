@@ -1,0 +1,72 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # The API: HTTP routes, quick synchronous endpoints (clone/tts/merge/analyze),
+  # and the queue producer for the slow end-to-end /ad/insert pipeline.
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      PYTHON_BIN: python3
+      JOB_STORAGE_DIR: /data/jobs
+      # Worker calls back into this container's /api/tts and /api/clone
+      # routes, and the API self-references it for the same reason.
+      API_BASE_URL: http://backend:3001
+      CORS_ORIGIN: http://localhost:5173
+    ports:
+      - "3001:3001"
+    volumes:
+      - job_data:/data/jobs
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Same image as `backend`, different entrypoint: consumes the "ad-insert"
+  # queue instead of serving HTTP. Scale with `docker compose up --scale worker=3`.
+  worker:
+    build:
+      context: ./backend
+    command: ["node", "worker.mjs"]
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      PYTHON_BIN: python3
+      JOB_STORAGE_DIR: /data/jobs
+      API_BASE_URL: http://backend:3001
+      WORKER_CONCURRENCY: "2"
+    volumes:
+      - job_data:/data/jobs
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Browser-facing URL, so localhost (not the "backend" service name).
+        VITE_API_BASE_URL: http://localhost:3001
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  redis_data:
+  job_data:
