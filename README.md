@@ -1,6 +1,8 @@
 # Semantic- and Signal-Aware Audio Ad Insertion Engine
 
-UofTHacks 13 Winner - MLH Best Use of ElevenLabs.
+UofTHacks 13 Winner - MLH Best Use of ElevenLabs
+
+Authors: James Weng, Ryan Li, David Yang
 
 Pipeline: Upload a product name and audio file with speech → ElevenLabs clones voice(s) and generates a human-like ad read → Call OpenAI API to generate ad text → the system finds the optimal insertion point based on syntactic + semantic context, stitching the ad into the final audio.
 
