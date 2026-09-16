@@ -1,8 +1,10 @@
-# Semantic- and Signal-Aware Audio Ad Insertion Engine
+# Slotify
 
-UofTHacks 13 Winner - MLH Best Use of ElevenLabs
+> UofTHacks 13 Winner - MLH Best Use of ElevenLabs
 
 Authors: James Weng, Ryan Li, David Yang
+
+Devpost: https://devpost.com/software/slotify-avmxe8
 
 Pipeline: Upload a product name and audio file with speech → ElevenLabs clones voice(s) and generates a human-like ad read → Call OpenAI API to generate ad text → the system finds the optimal insertion point based on syntactic + semantic context, stitching the ad into the final audio.
 
@@ -21,20 +23,29 @@ Pipeline: Upload a product name and audio file with speech → ElevenLabs clones
 - Audio pipeline: Python (pydub, librosa, pyloudnorm)
 - AI services: OpenAI (ad generation + placement), ElevenLabs (TTS/voice cloning)
 - Media tools: ffmpeg/ffprobe
+- Background jobs: Redis + BullMQ (queues the two-speaker `/ad/insert` pipeline)
+- Containers: Docker + docker-compose (backend, worker, frontend, redis)
 
 ## Project structure
 ```text
 .
 ├── README.md
+├── docker-compose.yml    # redis + backend + worker + frontend
+├── .env.example
 ├── backend/              # Node API + Python ad_inserter pipeline
 │   ├── ad_inserter/
 │   ├── audio_tests/
-│   ├── index.mjs
+│   ├── jobs/adInsertJob.mjs   # shared pipeline logic (used by worker.mjs)
+│   ├── lib/                   # redis.mjs, queue.mjs, jobStorage.mjs
+│   ├── index.mjs               # API (enqueues /ad/insert jobs)
+│   ├── worker.mjs              # BullMQ consumer for the ad-insert queue
+│   ├── Dockerfile
 │   ├── package.json
 │   └── requirements.txt
 ├── frontend/             # React UI
 │   ├── src/
 │   ├── index.html
+│   ├── Dockerfile
 │   ├── package.json
 │   └── vite.config.ts
 ├── docs/
@@ -76,7 +87,17 @@ npm run dev
 
 The UI runs on `http://localhost:5173` and calls the backend.
 
----
+### 3) Background worker (for `/ad/insert`)
+
+The two-speaker `POST /ad/insert` pipeline (diarization + LLM copywriting + ElevenLabs TTS + ffmpeg mix) can take well over a minute, so `index.mjs` queues it on Redis via [BullMQ](https://docs.bullmq.io/) instead of blocking the HTTP request, and `worker.mjs` is the process that actually consumes it:
+```bash
+npm run worker
+```
+This needs a Redis instance reachable at `REDIS_URL` (defaults to `redis://localhost:6379`). Without it, `/ad/insert` requests still get queued and return a `jobId`, they just sit unprocessed until a worker is running — every other route (`/api/clone`, `/api/tts`, `/api/merge`, `/api/insert-sections`, `/api/generate`, which is what the frontend actually calls today) responds synchronously and doesn't need Redis at all.
+
+### Or run everything with Docker
+
+`docker compose up --build` runs the whole stack without installing Node/Python/ffmpeg locally. Copy `.env.example` to `.env` first and fill in your API keys.
 
 ## Ad Inserter backend module
 - `__init__.py` exposes the package modules (analysis, llm, mix) and version
@@ -161,14 +182,22 @@ python -m ad_inserter.insert_ad \
 ```
 
 ### API example
+`POST /ad/insert` runs asynchronously on a Redis-backed BullMQ queue since the full pipeline can take well over a minute: `index.mjs` writes the upload to a shared volume and enqueues a job, `worker.mjs` consumes it and writes the result back, and the request returns a `jobId` immediately instead of streaming audio back directly. Poll `GET /api/jobs/:id` for status and fetch `GET /api/jobs/:id/result` once it reports `"completed"`:
+
 ```bash
 curl -X POST http://localhost:3001/ad/insert \
   -F "audio=@path/to/conversation.mp3" \
   -F "productName=Notion" \
   -F "productBlurb=AI-powered productivity workspace" \
   -F "adStyle=casual" \
-  -F "adMode=DUO" \
-  --output out.mp3
+  -F "adMode=DUO"
+# => {"jobId":"...", "statusUrl":"/api/jobs/...", "resultUrl":"/api/jobs/.../result"}
+
+# Poll until state is "completed":
+curl http://localhost:3001/api/jobs/<jobId>
+
+# Then download the finished audio:
+curl http://localhost:3001/api/jobs/<jobId>/result --output out.mp3
 ```
 
 ## LLM configuration
